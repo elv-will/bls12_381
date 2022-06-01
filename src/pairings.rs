@@ -11,7 +11,7 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use group::Group;
 use pairing::{Engine, PairingCurveAffine};
 use rand_core::RngCore;
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -39,6 +39,108 @@ impl ConditionallySelectable for MillerLoopResult {
         MillerLoopResult(Fp12::conditional_select(&a.0, &b.0, choice))
     }
 }
+//
+// Adaptation of Algorithm 5.5.4, Guide to Pairing-Based Cryptography
+// Faster Squaring in the Cyclotomic Subgroup of Sixth Degree Extensions
+// https://eprint.iacr.org/2009/565.pdf
+#[must_use]
+fn cyclotomic_square(f: Fp12) -> Fp12 {
+    let mut z0 = f.c0.c0;
+    let mut z4 = f.c0.c1;
+    let mut z3 = f.c0.c2;
+    let mut z2 = f.c1.c0;
+    let mut z1 = f.c1.c1;
+    let mut z5 = f.c1.c2;
+
+    let (t0, t1) = fp4_square(z0, z1);
+
+    // For A
+    z0 = t0 - z0;
+    z0 = z0 + z0 + t0;
+
+    z1 = t1 + z1;
+    z1 = z1 + z1 + t1;
+
+    let (mut t0, t1) = fp4_square(z2, z3);
+    let (t2, t3) = fp4_square(z4, z5);
+
+    // For C
+    z4 = t0 - z4;
+    z4 = z4 + z4 + t0;
+
+    z5 = t1 + z5;
+    z5 = z5 + z5 + t1;
+
+    // For B
+    t0 = t3.mul_by_nonresidue();
+    z2 = t0 + z2;
+    z2 = z2 + z2 + t0;
+
+    z3 = t2 - z3;
+    z3 = z3 + z3 + t2;
+
+    Fp12 {
+        c0: Fp6 {
+            c0: z0,
+            c1: z4,
+            c2: z3,
+        },
+        c1: Fp6 {
+            c0: z2,
+            c1: z1,
+            c2: z5,
+        },
+    }
+}
+
+#[must_use]
+fn fp4_square(a: Fp2, b: Fp2) -> (Fp2, Fp2) {
+    let t0 = a.square();
+    let t1 = b.square();
+    let mut t2 = t1.mul_by_nonresidue();
+    let c0 = t2 + t0;
+    t2 = a + b;
+    t2 = t2.square();
+    t2 -= t0;
+    let c1 = t2 - t1;
+
+    (c0, c1)
+}
+
+fn mul_n_sqr(ret: &mut Fp12, a: Fp12, n: usize) {
+    *ret = *ret * a;
+    for _ in 0..n {
+        *ret = cyclotomic_square(*ret)
+    }
+}
+
+// Taken from supranational/blst
+fn raise_to_z(a: Fp12) -> Fp12 {
+    // From blst pairing.c
+    let mut ret = cyclotomic_square(a);
+    mul_n_sqr(&mut ret, a, 2);
+    mul_n_sqr(&mut ret, a, 3);
+    mul_n_sqr(&mut ret, a, 9);
+    mul_n_sqr(&mut ret, a, 32);
+    mul_n_sqr(&mut ret, a, 16 - 1);
+    ret = ret.conjugate();
+    cyclotomic_square(ret)
+}
+
+// Taken from supranational/blst
+fn fp12_is_cyclotomic(f: Fp12) -> Choice {
+    let a = f.frobenius_map().frobenius_map();
+    let b = a.frobenius_map().frobenius_map() * f;
+    ((a == b) as u8).into()
+}
+
+// Check if the Gt element is in the correct group
+// Taken from supranational/blst
+fn fp12_is_in_group(f: Fp12) -> Choice {
+    let a = f.frobenius_map();
+    let b = raise_to_z(f);
+    return a.ct_eq(&b) & !f.is_zero() & fp12_is_cyclotomic(f);
+}
 
 impl MillerLoopResult {
     /// This performs a "final exponentiation" routine to convert the result
@@ -46,71 +148,6 @@ impl MillerLoopResult {
     /// operation in the so-called `cyclotomic subgroup` of `Fq6` so that
     /// it can be compared with other elements of `Gt`.
     pub fn final_exponentiation(&self) -> Gt {
-        #[must_use]
-        fn fp4_square(a: Fp2, b: Fp2) -> (Fp2, Fp2) {
-            let t0 = a.square();
-            let t1 = b.square();
-            let mut t2 = t1.mul_by_nonresidue();
-            let c0 = t2 + t0;
-            t2 = a + b;
-            t2 = t2.square();
-            t2 -= t0;
-            let c1 = t2 - t1;
-
-            (c0, c1)
-        }
-        // Adaptation of Algorithm 5.5.4, Guide to Pairing-Based Cryptography
-        // Faster Squaring in the Cyclotomic Subgroup of Sixth Degree Extensions
-        // https://eprint.iacr.org/2009/565.pdf
-        #[must_use]
-        fn cyclotomic_square(f: Fp12) -> Fp12 {
-            let mut z0 = f.c0.c0;
-            let mut z4 = f.c0.c1;
-            let mut z3 = f.c0.c2;
-            let mut z2 = f.c1.c0;
-            let mut z1 = f.c1.c1;
-            let mut z5 = f.c1.c2;
-
-            let (t0, t1) = fp4_square(z0, z1);
-
-            // For A
-            z0 = t0 - z0;
-            z0 = z0 + z0 + t0;
-
-            z1 = t1 + z1;
-            z1 = z1 + z1 + t1;
-
-            let (mut t0, t1) = fp4_square(z2, z3);
-            let (t2, t3) = fp4_square(z4, z5);
-
-            // For C
-            z4 = t0 - z4;
-            z4 = z4 + z4 + t0;
-
-            z5 = t1 + z5;
-            z5 = z5 + z5 + t1;
-
-            // For B
-            t0 = t3.mul_by_nonresidue();
-            z2 = t0 + z2;
-            z2 = z2 + z2 + t0;
-
-            z3 = t2 - z3;
-            z3 = z3 + z3 + t2;
-
-            Fp12 {
-                c0: Fp6 {
-                    c0: z0,
-                    c1: z4,
-                    c2: z3,
-                },
-                c1: Fp6 {
-                    c0: z2,
-                    c1: z1,
-                    c2: z5,
-                },
-            }
-        }
         #[must_use]
         fn cycolotomic_exp(f: Fp12) -> Fp12 {
             let x = BLS_X;
@@ -242,6 +279,43 @@ impl PartialEq for Gt {
     }
 }
 
+fn ser_fp6(f: &Fp6) -> [u8; 288] {
+    [
+        f.c0.c0.to_bytes(),
+        f.c0.c1.to_bytes(),
+        f.c1.c0.to_bytes(),
+        f.c1.c1.to_bytes(),
+        f.c2.c0.to_bytes(),
+        f.c2.c1.to_bytes(),
+    ]
+    .concat()
+    .try_into()
+    .unwrap()
+}
+
+fn deser_fp6(b: &[u8; 288]) -> subtle::CtOption<Fp6> {
+    Fp::from_bytes(b[0 * 48..48].try_into().unwrap()).and_then(|c0c0| {
+        Fp::from_bytes(b[1 * 48..2 * 48].try_into().unwrap()).and_then(|c0c1| {
+            Fp::from_bytes(b[2 * 48..3 * 48].try_into().unwrap()).and_then(|c1c0| {
+                Fp::from_bytes(b[3 * 48..4 * 48].try_into().unwrap()).and_then(|c1c1| {
+                    Fp::from_bytes(b[4 * 48..5 * 48].try_into().unwrap()).and_then(|c2c0| {
+                        Fp::from_bytes(b[5 * 48..6 * 48].try_into().unwrap()).and_then(|c2c1| {
+                            let mut f = Fp6::default();
+                            f.c0.c0 = c0c0;
+                            f.c0.c1 = c0c1;
+                            f.c1.c0 = c1c0;
+                            f.c1.c1 = c1c1;
+                            f.c2.c0 = c2c0;
+                            f.c2.c1 = c2c1;
+                            CtOption::new(f, 1.into())
+                        })
+                    })
+                })
+            })
+        })
+    })
+}
+
 impl Gt {
     /// Returns the group identity, which is $1$.
     pub fn identity() -> Gt {
@@ -251,6 +325,35 @@ impl Gt {
     /// Doubles this group element.
     pub fn double(&self) -> Gt {
         Gt(self.0.square())
+    }
+
+    /// Serialize the given Gt as a compressed point.
+    /// Uses torus-based compression from Section 4.1 in
+    /// "On Compressible Pairings and Their Computation" by Naehrig et al.
+    pub fn serialize_compressed(&self) -> [u8; 288] {
+        let mut c0 = self.0.c0.clone();
+
+        c0.c0 += Fp2::one();
+        let b = c0 * self.0.c1.invert().unwrap();
+        ser_fp6(&b)
+    }
+
+    /// Deserialize the compressed Gt point
+    pub fn deserialize_compressed(inp: &[u8; 288]) -> CtOption<Self> {
+        deser_fp6(&inp).and_then(|gt_compressed| {
+            let neg_one = Fp6::one().neg();
+            let t = Fp12 {
+                c0: gt_compressed,
+                c1: neg_one,
+            }
+            .invert()
+            .unwrap();
+            let c = Fp12 {
+                c0: gt_compressed,
+                c1: Fp6::one(),
+            } * t;
+            CtOption::new(Gt(c), fp12_is_in_group(c))
+        })
     }
 }
 
@@ -964,4 +1067,36 @@ fn tricking_miller_loop_result() {
         .final_exponentiation(),
         Gt::identity()
     );
+}
+
+#[test]
+fn test_fp12_in_group() {
+    use ff::Field;
+    use group::Curve;
+    use rand_core::SeedableRng;
+    let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(42);
+    for _ in 0..100 {
+        let rand_fp12 = Fp12::random(&mut rng);
+        assert!(fp12_is_in_group(rand_fp12).unwrap_u8() == 0)
+    }
+
+    for _ in 0..100 {
+        let rand_scalar = Scalar::random(&mut rng);
+        let gt = pairing(&(G1Affine::generator() * rand_scalar).to_affine(), &G2Affine::generator());
+        assert!(fp12_is_in_group(gt.0).unwrap_u8() == 1);
+    }
+}
+
+#[test]
+fn test_gt_serialization() {
+    use ff::Field;
+    use group::Curve;
+    use rand_core::SeedableRng;
+    let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(42);
+    let rand_scalar = Scalar::random(&mut rng);
+    let gt = pairing(&(G1Affine::generator() * rand_scalar).to_affine(), &G2Affine::generator());
+        
+    let ser = gt.serialize_compressed();
+    let gt2 = Gt::deserialize_compressed(&ser).unwrap();
+
 }

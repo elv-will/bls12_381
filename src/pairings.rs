@@ -279,14 +279,15 @@ impl PartialEq for Gt {
     }
 }
 
+// Serialize Fp6 in big endian
 fn ser_fp6(f: &Fp6) -> [u8; 288] {
     [
-        f.c0.c0.to_bytes(),
-        f.c0.c1.to_bytes(),
-        f.c1.c0.to_bytes(),
-        f.c1.c1.to_bytes(),
-        f.c2.c0.to_bytes(),
         f.c2.c1.to_bytes(),
+        f.c2.c0.to_bytes(),
+        f.c1.c1.to_bytes(),
+        f.c1.c0.to_bytes(),
+        f.c0.c1.to_bytes(),
+        f.c0.c0.to_bytes(),
     ]
     .concat()
     .try_into()
@@ -294,12 +295,12 @@ fn ser_fp6(f: &Fp6) -> [u8; 288] {
 }
 
 fn deser_fp6(b: &[u8; 288]) -> subtle::CtOption<Fp6> {
-    Fp::from_bytes(b[0 * 48..48].try_into().unwrap()).and_then(|c0c0| {
-        Fp::from_bytes(b[1 * 48..2 * 48].try_into().unwrap()).and_then(|c0c1| {
-            Fp::from_bytes(b[2 * 48..3 * 48].try_into().unwrap()).and_then(|c1c0| {
-                Fp::from_bytes(b[3 * 48..4 * 48].try_into().unwrap()).and_then(|c1c1| {
-                    Fp::from_bytes(b[4 * 48..5 * 48].try_into().unwrap()).and_then(|c2c0| {
-                        Fp::from_bytes(b[5 * 48..6 * 48].try_into().unwrap()).and_then(|c2c1| {
+    Fp::from_bytes(b[0 * 48..48].try_into().unwrap()).and_then(|c2c1| {
+        Fp::from_bytes(b[1 * 48..2 * 48].try_into().unwrap()).and_then(|c2c0| {
+            Fp::from_bytes(b[2 * 48..3 * 48].try_into().unwrap()).and_then(|c1c1| {
+                Fp::from_bytes(b[3 * 48..4 * 48].try_into().unwrap()).and_then(|c1c0| {
+                    Fp::from_bytes(b[4 * 48..5 * 48].try_into().unwrap()).and_then(|c0c1| {
+                        Fp::from_bytes(b[5 * 48..6 * 48].try_into().unwrap()).and_then(|c0c0| {
                             let mut f = Fp6::default();
                             f.c0.c0 = c0c0;
                             f.c0.c1 = c0c1;
@@ -1099,4 +1100,5 @@ fn test_gt_serialization() {
     let ser = gt.serialize_compressed();
     let gt2 = Gt::deserialize_compressed(&ser).unwrap();
 
+    assert_eq!(gt,  gt2);
 }
